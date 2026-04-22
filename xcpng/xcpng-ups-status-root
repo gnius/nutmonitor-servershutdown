@@ -1,0 +1,6 @@
+#!/bin/bash
+set -euo pipefail
+
+echo "host=$(hostname)"
+echo "time=$(date -Is)"
+echo "status=ok"
