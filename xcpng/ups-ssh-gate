@@ -1,0 +1,17 @@
+#!/bin/bash
+set -euo pipefail
+
+cmd="${SSH_ORIGINAL_COMMAND:-}"
+
+case "$cmd" in
+  status)
+    exec sudo /usr/local/sbin/xcpng-ups-status-root
+    ;;
+  shutdown)
+    exec sudo /usr/local/sbin/xcpng-ups-shutdown-root
+    ;;
+  *)
+    echo "Denied"
+    exit 1
+    ;;
+esac
