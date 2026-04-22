@@ -1,121 +1,267 @@
 # nutmonitor-servershutdown
 
-A small Docker-based NUT client that monitors a UPS, calculates remaining battery runtime, sends an email notification when shutdown is triggered, and cleanly shuts down an XCP-ng host through a tightly restricted SSH account.
+## 🧠 Project Rationale
 
-## What it does
+Traditional UPS shutdown approaches are designed for single machines. In a virtualization environment like XCP-ng, that model breaks down because:
 
-- Polls a NUT server with `upsc`
-- Watches `ups.status` and `battery.runtime`
-- Triggers shutdown when the UPS is on battery and runtime is less than or equal to a configured threshold
-- Sends an email notification when the shutdown command is issued
-- Connects to XCP-ng over SSH using a dedicated account that cannot obtain an interactive shell
-- Runs only two privileged operations on XCP-ng through fixed root-owned wrappers:
-  - `status`
-  - `shutdown`
-- Shuts down running resident VMs before shutting down the XCP-ng host
+- Multiple virtual machines must be shut down cleanly before the host
+- The hypervisor should remain minimal and not run additional agents
+- Granting external systems shell access introduces security risks
 
-## Security model
+This project solves those problems by separating responsibilities:
 
-The container does **not** get a general shell on the XCP-ng host.
+- A lightweight external monitor (Docker container) makes decisions
+- The hypervisor executes only tightly controlled, pre-approved actions
 
-- SSH key authentication only
-- `ForceCommand` on the XCP-ng side
-- `restrict` option in `authorized_keys`
-- no PTY, no forwarding, no agent, no X11
-- `sudo` limited to two exact root-owned scripts
+Key goals:
 
-This keeps the container from being able to run arbitrary commands on the virtualization server.
+- Runtime-based shutdown decisions (not just "power lost")
+- Graceful VM-first shutdown
+- Strong security boundaries (no arbitrary command execution)
 
-## Repository layout
+---
 
-- `Dockerfile` - container image
-- `docker-compose.yml` - example deployment
-- `monitor.sh` - main polling and decision logic
-- `xcpng/ups-ssh-gate` - forced SSH gate on XCP-ng
-- `xcpng/xcpng-ups-status-root` - minimal status wrapper
-- `xcpng/xcpng-ups-shutdown-root` - VM shutdown loop and host shutdown wrapper
-- `xcpng/install-xcpng-side.sh` - helper installer for the XCP-ng side
-- `.env.example` - example environment configuration
+## 🧾 Solution Overview
 
-## Container behavior
+### High-level summary
 
-The monitor loop:
+This system monitors a UPS via NUT and, when battery runtime drops below a defined threshold, triggers a controlled shutdown of an XCP-ng host and its virtual machines.
 
-1. Reads `ups.status`
-2. Reads `battery.runtime`
-3. If power is restored (`OL`), it clears its shutdown latch
-4. If on battery (`OB` or `LB`) and runtime is less than or equal to the configured threshold, it:
-   - sends an email notification if SMTP is configured
-   - calls the restricted SSH `shutdown` command
-   - latches to avoid repeated shutdown requests
+### Detailed flow
 
-## XCP-ng behavior
+1. Container polls NUT (`upsc`)
+2. Reads:
+   - `ups.status` (OL / OB / LB)
+   - `battery.runtime` (seconds remaining)
+3. If:
+   - UPS is on battery AND
+   - runtime ≤ threshold
+4. Then:
+   - Send email notification (optional)
+   - Execute restricted SSH command
+5. XCP-ng host:
+   - disables itself
+   - shuts down VMs
+   - shuts down host
 
-The shutdown wrapper:
+---
 
-1. Disables the host
-2. Enumerates running resident VMs that are not the control domain
-3. Attempts graceful shutdown for each VM
-4. Waits for a configurable grace period
-5. Force shuts down any remaining running resident VMs
-6. Calls `xe host-shutdown`
+## 🏗️ Architecture
 
-## Quick start
+```
+UPS → NUT Server → Docker Monitor → (restricted SSH) → XCP-ng → VMs
+```
 
-### 1. Create SSH key material on the Docker host
+---
+
+## 🔐 Security Model
+
+Security is a core design feature, not an afterthought.
+
+### SSH restrictions
+
+- key-based authentication only
+- forced command (`ForceCommand`)
+- `restrict` in authorized_keys
+- no PTY
+- no port forwarding
+- no agent forwarding
+
+### Privilege control
+
+- dedicated user: `nutshutdown`
+- no shell access
+- `sudo` restricted to two exact scripts:
+  - status
+  - shutdown
+
+### Result
+
+Even if the container is compromised:
+
+- it cannot run arbitrary commands
+- it cannot obtain a shell
+- it cannot escalate privileges beyond predefined actions
+
+---
+
+## ⚙️ Components
+
+### Container
+
+- polls NUT
+- evaluates shutdown condition
+- sends email notification
+- triggers SSH command
+
+### XCP-ng side
+
+- SSH gate enforces allowed commands
+- root scripts perform controlled operations
+
+### Shutdown sequence
+
+1. Disable host
+2. Enumerate running resident VMs
+3. Gracefully shut down VMs
+4. Wait 60 seconds
+5. Force shutdown remaining VMs
+6. Shutdown host
+
+---
+
+## 📁 Repository Structure
+
+- `Dockerfile`
+- `docker-compose.yml`
+- `monitor.sh`
+- `.env.example`
+- `xcpng/`
+  - `ups-ssh-gate`
+  - `xcpng-ups-status-root`
+  - `xcpng-ups-shutdown-root`
+  - `install-xcpng-side.sh`
+
+---
+
+## 🚀 Full Setup Instructions
+
+### 1. Clone repository
+
+```bash
+git clone https://github.com/gnius/nutmonitor-servershutdown.git
+cd nutmonitor-servershutdown
+```
+
+---
+
+### 2. Generate SSH keys
 
 ```bash
 mkdir -p secrets
+
 ssh-keygen -t ed25519 -f secrets/id_ed25519 -N ""
-ssh-keyscan -H 192.168.1.20 > secrets/known_hosts
+ssh-keyscan -H <XCP-IP> > secrets/known_hosts
+
 chmod 600 secrets/id_ed25519 secrets/known_hosts
 ```
 
-### 2. Install the XCP-ng side scripts
+---
 
-Copy the files in `xcpng/` to the XCP-ng host and run:
+### 3. Install on XCP-ng host
 
 ```bash
+scp -r xcpng root@<XCP-IP>:/root/
+ssh root@<XCP-IP>
+
+cd /root/xcpng
 chmod +x install-xcpng-side.sh
 ./install-xcpng-side.sh
 ```
 
-Then add the public key from `secrets/id_ed25519.pub` to `/home/nutshutdown/.ssh/authorized_keys` using the `restrict` prefix.
+---
+
+### 4. Add SSH public key
+
+```bash
+nano /home/nutshutdown/.ssh/authorized_keys
+```
+
+Add:
+
+```text
+restrict ssh-ed25519 AAAA...yourkey...
+```
+
+---
+
+### 5. Configure environment
+
+```bash
+cp .env.example .env
+nano .env
+```
 
 Example:
 
-```text
-restrict ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA...yourkey...
+```bash
+NUT_UPS=myups@192.168.1.50:3493
+XCP_HOST=192.168.1.20
+
+RUNTIME_THRESHOLD_SECONDS=600
+POLL_INTERVAL_SECONDS=30
+
+SMTP_ENABLED=true
+SMTP_HOST=smtp.example.com
+SMTP_PORT=587
+SMTP_USER=user@example.com
+SMTP_PASS=password
+SMTP_FROM=user@example.com
+SMTP_TO=alert@example.com
 ```
 
-### 3. Configure the container
+---
 
-Copy `.env.example` to `.env` and edit the values.
-
-### 4. Start the service
+### 6. Run container
 
 ```bash
 docker compose up -d --build
 ```
 
-## Required NUT variables
+---
 
-This project expects the NUT server to expose:
+## 🧪 Testing
 
-- `ups.status`
-- `battery.runtime`
+### Safe test
 
-## Email notifications
+Set:
 
-Email sending is optional. If SMTP settings are provided, the container uses `msmtp` to send an email when shutdown is triggered.
+```bash
+RUNTIME_THRESHOLD_SECONDS=999999
+```
 
-## Notes for XCP-ng pools
+Then disconnect utility power.
 
-The current wrapper is designed to safely shut down resident VMs and then the host itself. In a pool, shutdown of a pool master and HA-enabled environments should be planned carefully because host shutdown behavior depends on pool role and HA state.
+Verify:
 
-## References
+- Email sent
+- SSH command executed
+- Shutdown begins
 
-- XCP-ng general shutdown flow: disable host, migrate or shut down VMs, then shut down host.
-- `xe host-shutdown` requires the host to be disabled first.
-- NUT exposes `battery.runtime` in seconds and `ups.status` state flags.
-- OpenSSH supports `restrict` and forced commands in `authorized_keys` / `sshd` policy.
+---
+
+## ⚠️ Notes
+
+### XCP-ng pools
+
+- Behavior differs in HA environments
+- Test carefully before production use
+
+### NUT accuracy
+
+- `battery.runtime` depends on UPS quality
+- Conservative thresholds are recommended
+
+---
+
+## 🔮 Future Improvements
+
+- Multi-host orchestration
+- Tiered shutdown policies
+- Webhook notifications
+- Health checks and retry logic
+
+---
+
+## 👍 Summary
+
+This project provides a:
+
+- Secure
+- Predictable
+- UPS-aware
+- Virtualization-friendly
+
+shutdown mechanism.
+
+It cleanly separates decision-making from execution while maintaining strict control over system access.
