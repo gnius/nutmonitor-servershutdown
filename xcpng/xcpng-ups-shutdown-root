@@ -1,0 +1,25 @@
+#!/bin/bash
+set -euo pipefail
+
+HOST="$(hostname -s)"
+
+logger -t ups-shutdown "UPS-triggered shutdown for $HOST"
+
+xe host-disable host="$HOST" || true
+
+VMS="$(xe vm-list resident-on="$HOST" power-state=running is-control-domain=false --minimal)"
+
+if [[ -n "$VMS" ]]; then
+  IFS=',' read -r -a vm_array <<< "$VMS"
+  for vm in "${vm_array[@]}"; do
+    xe vm-shutdown uuid="$vm" || true
+  done
+
+  sleep 60
+
+  for vm in "${vm_array[@]}"; do
+    xe vm-shutdown uuid="$vm" force=true || true
+  done
+fi
+
+xe host-shutdown host="$HOST"
